@@ -244,13 +244,20 @@ static void prevent_leaked_file_descriptors() {
     closedir(dir);
 }
 
-static long strtolx_positive(const char *s, const char *what) {
+static long strtolx(const char *s, const char *what) {
     char *end;
     errno = 0;
     long result = strtol(s, &end, 10);
     if (errno) errx(EXIT_FAILURE, "%s is too large", what);
-    if (*end != '\0' || result < 0)
-        errx(EXIT_FAILURE, "%s must be a positive integer", what);
+    if (*end != '\0')
+        errx(EXIT_FAILURE, "%s must be an integer", what);
+    return result;
+}
+
+static long strtolx_positive(const char *s, const char *what) {
+    long result = strtolx(s, what);
+    if (result < 0)
+        errx(EXIT_FAILURE, "%s must be positive", what);
     return result;
 }
 
@@ -342,6 +349,42 @@ static void handle_signal(int sig_fd, sd_bus *connection, const char *unit_name,
     default:
         break;
     }
+}
+
+struct scmp_arg_cmp parse_parameter_check(char *arg) {
+    char *saveptr;
+    char *start = strtok_r(arg, ":", &saveptr);
+    long index = strtolx_positive(start, "index");
+
+    start = strtok_r(NULL, ":", &saveptr);
+    if (!start) {
+        errx(EXIT_FAILURE, "invalid system call whitelist");
+    }
+
+    enum scmp_compare op;
+    if (!strcmp(start, "!=")) {
+        op = SCMP_CMP_NE;
+    } else if (!strcmp(start, "<")) {
+        op = SCMP_CMP_LT;
+    } else if (!strcmp(start, "<=")) {
+        op = SCMP_CMP_LE;
+    } else if (!strcmp(start, "==")) {
+        op = SCMP_CMP_EQ;
+    } else if (!strcmp(start, ">=")) {
+        op = SCMP_CMP_GE;
+    } else if (!strcmp(start, ">")) {
+        op = SCMP_CMP_GT;
+    } else {
+        errx(EXIT_FAILURE, "invalid system call whitelist operator: %s", start);
+    }
+
+    start = strtok_r(NULL, "", &saveptr);
+    if (!start) {
+        errx(EXIT_FAILURE, "invalid system call whitelist");
+    }
+    long value = strtolx(start, "value");
+
+    return SCMP_CMP(index, op, value);
 }
 
 int main(int argc, char **argv) {
@@ -460,7 +503,25 @@ int main(int argc, char **argv) {
         ssize_t n_read;
         while ((n_read = getline(&line, &len, file)) != -1) {
             if (line[n_read - 1] == '\n') line[n_read - 1] = '\0';
-            check(seccomp_rule_add(ctx, SCMP_ACT_ALLOW, get_syscall_nr(line), 0));
+            char *saveptr;
+            strtok_r(line, " ", &saveptr);
+            unsigned n_args = 0;
+            struct scmp_arg_cmp *args = NULL;
+            for (;;) {
+                char *arg = strtok_r(NULL, " ", &saveptr);
+                if (!arg) break;
+                n_args++;
+                size_t total = n_args * sizeof(struct scmp_arg_cmp);
+                if (total / sizeof(struct scmp_arg_cmp) != n_args) {
+                    errx(EXIT_FAILURE, "realloc: %s", strerror(ENOMEM));
+                }
+                args = realloc(args, n_args * sizeof(struct scmp_arg_cmp));
+                if (!args) {
+                    err(EXIT_FAILURE, "realloc");
+                }
+                args[n_args - 1] = parse_parameter_check(arg);
+            }
+            check(seccomp_rule_add_array(ctx, SCMP_ACT_ALLOW, get_syscall_nr(line), n_args, args));
         }
         if (ferror(file)) {
             err(EXIT_FAILURE, "getline");
